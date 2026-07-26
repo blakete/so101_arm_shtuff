@@ -12,21 +12,60 @@ alongside.
   librealsense defaults if that profile combination is unavailable.
 - Depth is aligned to the color frame by default and colorized by librealsense.
 - The window auto-sizes to 92% of the detected screen and centers itself.
+
+### Layout
+
+Default is a 2x2 grid, cycled with `l`:
+
+```
+kGrid (default)              kRow                      kStack
++----------+----------+      +-------+-------+-----+   +-------+-----+
+| follower |  RGB     |      |  RGB  | depth |arms |   |  RGB  |arms |
++----------+----------+      +-------+-------+-----+   +-------+     |
+| leader   |  depth   |                                | depth |     |
++----------+----------+                                +-------+-----+
+```
+
+In `kGrid` all four cells are the camera's 1280x720, so the canvas is 2560x1440
+- 16:9, which matches exopack's screen almost exactly. Depth is resampled to the
+color cell size in this layout so the cells stay square with each other even
+when alignment is toggled off.
 - Overlay shows live fps, alignment mode, colormap, and the depth in meters at
   the center crosshair.
 
 ## Joint panel
 
-`sts_bus.h` speaks the Feetech STS/SCS serial protocol to the arm's six STS3215
-servos over `/dev/ttyACM0` at 1 Mbaud. One 8-byte read per servo from address 56
-returns position, speed, load, voltage and temperature in a single transaction.
+`sts_bus.h` speaks the Feetech STS/SCS serial protocol to each arm's six STS3215
+servos at 1 Mbaud. One 8-byte read per servo from address 56 returns position,
+speed, load, voltage and temperature in a single transaction.
 
-`arm_monitor.h` runs that polling on its own thread (~45 Hz measured) and hands
-the render loop a mutex-guarded snapshot. This matters: each USB-CDC round trip
+### Multiple arms
+
+Every CH34x driver board under `/dev/serial/by-id/*1a86*` is treated as an arm
+and gets its own poll thread and panel, stacked in the right-hand column. The
+boards on exopack:
+
+| CH343 serial | role |
+| --- | --- |
+| `5AE6082981` | follower |
+| `5AE6085251` | leader / teleop |
+
+That mapping lives in `label_for()` in `arm_monitor.h`; an unrecognised board is
+labelled with its serial. `--port <dev>` restricts the viewer to one arm.
+
+Device paths are always resolved through `/dev/serial/by-id/`, never `ttyACMn`.
+The by-id name derives from the CH343's serial number, so it follows a given
+board across replugs, cable swaps, and USB hubs — the `ttyACMn` index does not.
+
+`arm_monitor.h` runs each arm's polling on its own thread (~45 Hz measured per
+arm, with two arms attached) and hands the render loop a mutex-guarded snapshot. This matters: each USB-CDC round trip
 costs a millisecond or two, so polling six servos inline in the camera loop
 would cost roughly a third of the framerate. If the port cannot be opened the
 thread retries once a second, so plugging the arm in mid-run picks it up, and an
-absent arm just shows "no response" rows without touching the video.
+absent arm just shows "no response" rows without touching the video. After ~10
+consecutive failed polls it closes the port and re-resolves the path, so an
+unplug/replug recovers on its own — a yanked USB device otherwise leaves a stale
+fd that fails forever.
 
 **Read-only.** The bus client implements PING and READ only — there is no code
 path that writes a servo register, so it cannot change torque, limits, IDs, or
@@ -101,17 +140,25 @@ seat0):
 | `q` / `Esc` | quit |
 | `a` | toggle depth→color alignment |
 | `c` | cycle depth colormap (Jet / WhiteToBlack / BlackToWhite / Hue) |
-| `l` | toggle layout (side-by-side ↔ stacked) |
+| `l` | cycle layout (grid → row → stacked) |
 | `j` | toggle the joint panel |
 | `f` | toggle fullscreen |
 | `s` | save `d455_snapshot_N.png` of the current view |
 
 ### Performance note
 
-On exopack's 6144x3456 display the window lands at 5652x1589, a ~220% upscale
-of the 2560x720 canvas. Scaling that many pixels costs the Jetson roughly 7
-fps: the camera still delivers 30 fps, but the displayed rate settles around
-23. Pass a smaller `--scale` if you want the full 30 fps on screen.
+The camera always delivers 30 fps; the displayed rate is limited by how many
+pixels the Jetson has to scale up each frame. Measured on exopack's 6144x3456
+display with the 2x2 grid (2560x1440 canvas):
+
+| `--scale` | window | displayed |
+| --- | --- | --- |
+| 0.92 (default) | 5652x3179 (18 MP) | 12.5 fps |
+| 0.6 | 3686x2073 (7.6 MP) | 18.5 fps |
+
+The cost is the window upscale, not the camera or the servo polling — halving
+the displayed pixel count buys back roughly half the lost framerate. Use
+`--scale` to pick your point on that curve.
 
 ### Headless check
 
@@ -122,6 +169,13 @@ SSH without a display.
 ## Hardware notes
 
 - D455: serial `241122301570`, FW `5.16.0.1`, negotiated USB 3.2.
-- SO-101 arm: CH343 USB-serial bridge (`1a86:55d3`) on `/dev/ttyACM0`, stable
-  path `/dev/serial/by-id/usb-1a86_USB_Single_Serial_5AE6082981-if00`; 6 Feetech
-  servos answer PING at IDs 1–6 at 1 Mbaud.
+- SO-101 arms: two CH343 USB-serial bridges (`1a86:55d3`), serials `5AE6082981`
+  (follower) and `5AE6085251` (leader/teleop). Both answer PING on six servos at
+  IDs 1–6, 1 Mbaud.
+- All twelve servos report **5.4 V** supply (STS3215 nominal is 7.4 V) and a flat
+  0.0% load, consistent with the buses running on logic power only. Encoders read
+  fine; the arms will not hold position or move like this. Deferred, not fixed.
+- A dead USB cable will enumerate the CH343 fine while passing no servo traffic:
+  the leader showed a healthy `/dev/serial/by-id` entry but zero PING replies
+  across every baud from 9600 to 1 M until the cable was swapped. If a board
+  appears but no servo answers, suspect the cable before the servos.

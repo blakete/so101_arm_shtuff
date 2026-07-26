@@ -24,6 +24,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <iostream>
+#include <memory>
 #include <string>
 #include <thread>
 #include <vector>
@@ -57,12 +58,26 @@ constexpr int kFps = 30;
 // Fraction of the screen the window should occupy by default.
 constexpr double kDefaultScreenFrac = 0.92;
 
-// SO-101 servo bus defaults.
-constexpr const char* kDefaultArmPort = "/dev/ttyACM0";
+// SO-101 servo bus defaults. "auto" resolves the CH34x by-id symlink, which
+// survives replugs and hub changes; --port overrides it with a literal device.
+constexpr const char* kDefaultArmPort = "auto";
 constexpr int kArmBaud = 1000000;
 
-// Joint panel width, as a fraction of the video canvas width.
+// Joint panel width in the non-grid layouts, as a fraction of the video canvas.
 constexpr double kPanelFrac = 0.42;
+
+// kGrid   : arm panels in the left column, RGB over depth in the right column.
+// kRow    : RGB and depth side by side, arm panels in a column on the right.
+// kStack  : RGB over depth, arm panels in a column on the right.
+enum class Layout { kGrid, kRow, kStack };
+
+Layout next_layout(Layout l) {
+  switch (l) {
+    case Layout::kGrid: return Layout::kRow;
+    case Layout::kRow: return Layout::kStack;
+    default: return Layout::kGrid;
+  }
+}
 
 // rs2 colorizer presets: 0 Jet, 1 Classic, 2 WhiteToBlack, 3 BlackToWhite,
 // 4 Bio, 5 Cold, 6 Warm, 7 Quantized, 8 Pattern, 9 Hue
@@ -143,27 +158,43 @@ int main(int argc, char** argv) try {
     }
   }
 
-  // Servo-bus only: no camera, no window. Handy for checking the arm over SSH.
+  // Servo-bus only: no camera, no window. Handy for checking arms over SSH.
   if (dump_joints) {
-    arm::Monitor mon;
-    mon.start(arm_port, kArmBaud);
+    const std::vector<std::string> ports =
+        (arm_port == kDefaultArmPort) ? arm::resolve_ports()
+                                      : std::vector<std::string>{arm_port};
+    if (ports.empty()) {
+      std::cerr << "No CH34x driver board found under /dev/serial/by-id.\n";
+      return 1;
+    }
+    std::vector<std::unique_ptr<arm::Monitor>> mons;
+    for (const std::string& p : ports) {
+      mons.push_back(std::make_unique<arm::Monitor>());
+      mons.back()->start(p, kArmBaud);
+    }
     for (int t = 0; t < 10; ++t) {
       std::this_thread::sleep_for(std::chrono::milliseconds(500));
-      const arm::Snapshot s = mon.snapshot();
-      std::printf("[%4.0f Hz] %s\n", s.poll_hz, s.status.c_str());
-      for (int i = 0; i < arm::kNumJoints; ++i) {
-        const arm::Joint& j = s.joints[i];
-        if (!j.responding) {
-          std::printf("  %d %-14s  no response\n", i + 1, arm::kJointNames[i]);
-          continue;
+      for (size_t a = 0; a < mons.size(); ++a) {
+        const arm::Snapshot s = mons[a]->snapshot();
+        std::printf("[%4.0f Hz] %s\n          %s\n", s.poll_hz,
+                    arm::label_for(ports[a]).c_str(), s.status.c_str());
+        for (int i = 0; i < arm::kNumJoints; ++i) {
+          const arm::Joint& j = s.joints[i];
+          if (!j.responding) {
+            std::printf("  %d %-14s  no response\n", i + 1, arm::kJointNames[i]);
+            continue;
+          }
+          std::printf(
+              "  %d %-14s %4u tk  %+7.1f deg  load %+5.1f%%  %2u C  %.1f V\n",
+              i + 1, arm::kJointNames[i], j.p.position,
+              arm::ticks_to_deg(j.p.position), j.p.load / 10.0,
+              j.p.temperature, j.p.voltage / 10.0);
         }
-        std::printf("  %d %-14s %4u tk  %+7.1f deg  load %+5.1f%%  %2u C  %.1f V\n",
-                    i + 1, arm::kJointNames[i], j.p.position,
-                    arm::ticks_to_deg(j.p.position), j.p.load / 10.0,
-                    j.p.temperature, j.p.voltage / 10.0);
       }
     }
-    mon.stop();
+    for (auto& m : mons) {
+      m->stop();
+    }
     return 0;
   }
 
@@ -219,17 +250,29 @@ int main(int argc, char** argv) try {
   colorizer.set_option(RS2_OPTION_COLOR_SCHEME,
                        static_cast<float>(kColormaps[colormap_idx].first));
 
-  // The servo bus is polled on its own thread; the camera loop only ever reads
+  // Each servo bus is polled on its own thread; the camera loop only ever reads
   // the latest snapshot, so bus latency cannot drag the framerate down.
-  arm::Monitor arm_monitor;
+  std::vector<std::unique_ptr<arm::Monitor>> monitors;
+  std::vector<std::string> arm_titles;
   if (use_arm) {
-    arm_monitor.start(arm_port, kArmBaud);
-    std::cout << "Arm    : polling " << arm_port << " @ " << kArmBaud / 1000000
-              << " Mbaud" << std::endl;
+    // Every CH34x driver board present is treated as an arm. Each monitor gets
+    // its literal by-id path, which stays stable for that board across replugs.
+    const std::vector<std::string> ports =
+        (arm_port == kDefaultArmPort) ? arm::resolve_ports()
+                                      : std::vector<std::string>{arm_port};
+    if (ports.empty()) {
+      std::cout << "Arm    : no CH34x driver board found" << std::endl;
+    }
+    for (const std::string& p : ports) {
+      arm_titles.push_back(arm::label_for(p));
+      monitors.push_back(std::make_unique<arm::Monitor>());
+      monitors.back()->start(p, kArmBaud);
+      std::cout << "Arm    : " << arm_titles.back() << " on " << p << std::endl;
+    }
   }
 
   bool aligned = true;
-  bool side_by_side = true;
+  Layout layout = Layout::kGrid;
   bool show_panel = use_arm;
   bool window_was_visible = false;
   cv::Size sized_for(0, 0);  // canvas size the window was last fitted to
@@ -294,27 +337,48 @@ int main(int argc, char** argv) try {
       cv::drawMarker(*m, c, cv::Scalar(0, 255, 255), cv::MARKER_CROSS, 28, 3);
     }
 
-    cv::Mat canvas;
-    if (side_by_side) {
-      if (depth_img.rows != color_img.rows) {
-        cv::resize(depth_img, depth_img,
-                   cv::Size(depth_img.cols * color_img.rows / depth_img.rows,
-                            color_img.rows));
+    std::vector<arm::Snapshot> snaps;
+    if (show_panel && !monitors.empty()) {
+      snaps.reserve(monitors.size());
+      for (const auto& m : monitors) {
+        snaps.push_back(m->snapshot());
       }
-      cv::hconcat(color_img, depth_img, canvas);
-    } else {
-      if (depth_img.cols != color_img.cols) {
-        cv::resize(depth_img, depth_img,
-                   cv::Size(color_img.cols,
-                            depth_img.rows * color_img.cols / depth_img.cols));
-      }
-      cv::vconcat(color_img, depth_img, canvas);
     }
 
-    if (show_panel) {
-      const int pw = static_cast<int>(canvas.cols * kPanelFrac);
-      cv::Mat panel = arm::render_panel(arm_monitor.snapshot(), pw, canvas.rows);
-      cv::hconcat(canvas, panel, canvas);
+    cv::Mat canvas;
+    if (!snaps.empty() && layout == Layout::kGrid) {
+      // 2x2: arm panels down the left column, camera streams down the right.
+      // Depth is forced to the color cell size so all four cells match, which
+      // matters when alignment is off and depth is still at 848x480.
+      if (depth_img.size() != color_img.size()) {
+        cv::resize(depth_img, depth_img, color_img.size());
+      }
+      cv::Mat right;
+      cv::vconcat(color_img, depth_img, right);
+      cv::Mat left =
+          arm::render_panels(arm_titles, snaps, color_img.cols, right.rows);
+      cv::hconcat(left, right, canvas);
+    } else {
+      if (layout == Layout::kStack) {
+        if (depth_img.cols != color_img.cols) {
+          cv::resize(depth_img, depth_img,
+                     cv::Size(color_img.cols,
+                              depth_img.rows * color_img.cols / depth_img.cols));
+        }
+        cv::vconcat(color_img, depth_img, canvas);
+      } else {
+        if (depth_img.rows != color_img.rows) {
+          cv::resize(depth_img, depth_img,
+                     cv::Size(depth_img.cols * color_img.rows / depth_img.rows,
+                              color_img.rows));
+        }
+        cv::hconcat(color_img, depth_img, canvas);
+      }
+      if (!snaps.empty()) {
+        const int pw = static_cast<int>(canvas.cols * kPanelFrac);
+        cv::Mat panel = arm::render_panels(arm_titles, snaps, pw, canvas.rows);
+        cv::hconcat(canvas, panel, canvas);
+      }
     }
 
     if (headless) {
@@ -350,7 +414,7 @@ int main(int argc, char** argv) try {
     } else if (key == 'a') {
       aligned = !aligned;
     } else if (key == 'l') {
-      side_by_side = !side_by_side;
+      layout = next_layout(layout);
     } else if (key == 'j') {
       show_panel = !show_panel;
     } else if (key == 'f') {
@@ -381,7 +445,9 @@ int main(int argc, char** argv) try {
     }
   }
 
-  arm_monitor.stop();
+  for (auto& m : monitors) {
+    m->stop();
+  }
   pipe.stop();
   return 0;
 } catch (const rs2::error& e) {
