@@ -7,11 +7,20 @@ Scratch workspace for the SO-101 arm + D455 setup on `exopack` (Jetson, L4T 35.4
 C++ viewer that streams RGB + depth from the Intel RealSense D455 and shows
 them side by side in one window.
 
-- Color and depth at 848x480 @ 30 fps (D455 native depth width — no FOV crop),
-  falling back to librealsense defaults if that profile is unavailable.
+- Color at 1280x720 @ 30 fps, depth at 848x480 @ 30 fps. Falls back to
+  librealsense defaults if that profile combination is unavailable.
 - Depth is aligned to the color frame by default and colorized by librealsense.
+- The window auto-sizes to 92% of the detected screen and centers itself.
 - Overlay shows live fps, alignment mode, colormap, and the depth in meters at
   the center crosshair.
+
+### Why depth is 848x480 and not 1280x720
+
+848x480 is the D455's native stereo resolution. Requesting 1280x720 depth
+visibly thins out returns on low-texture surfaces (a plain white table came
+back mostly empty, with no return at all at the center pixel). Alignment
+resamples depth onto the 1280x720 color grid regardless, so requesting the
+sensor's native profile costs nothing and keeps the depth image dense.
 
 ### Build
 
@@ -40,6 +49,14 @@ seat0):
 ./run_on_desktop.sh          # equivalent to DISPLAY=:1 ./build/d455_viewer
 ```
 
+### Options
+
+| flag | effect |
+| --- | --- |
+| `--scale 0.1..1.0` | fraction of the screen the window fills (default `0.92`) |
+| `--fullscreen` | start in true fullscreen |
+| `--headless` | no window; grab 30 frames and write `/tmp/d455_headless.png` |
+
 ### Keys
 
 | key | action |
@@ -47,7 +64,16 @@ seat0):
 | `q` / `Esc` | quit |
 | `a` | toggle depth→color alignment |
 | `c` | cycle depth colormap (Jet / WhiteToBlack / BlackToWhite / Hue) |
+| `l` | toggle layout (side-by-side ↔ stacked) |
+| `f` | toggle fullscreen |
 | `s` | save `d455_snapshot_N.png` of the current view |
+
+### Performance note
+
+On exopack's 6144x3456 display the window lands at 5652x1589, a ~220% upscale
+of the 2560x720 canvas. Scaling that many pixels costs the Jetson roughly 7
+fps: the camera still delivers 30 fps, but the displayed rate settles around
+23. Pass a smaller `--scale` if you want the full 30 fps on screen.
 
 ### Headless check
 

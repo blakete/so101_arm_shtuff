@@ -39,10 +39,15 @@
 
 namespace {
 
-// D455 native profiles that both color and depth support at 30 fps. Larger
-// than 848x480 so a near-fullscreen window shows real detail, not upscale mush.
-constexpr int kWidth = 1280;
-constexpr int kHeight = 720;
+// Color runs at 1280x720 so a near-fullscreen window shows real detail.
+// Depth stays at 848x480: that is the D455's native stereo resolution, and
+// asking for 1280x720 depth measurably thins out the point returns on
+// low-texture surfaces. Aligning to color upsamples it to the color grid
+// anyway, so we lose nothing by requesting the sensor's best profile.
+constexpr int kColorWidth = 1280;
+constexpr int kColorHeight = 720;
+constexpr int kDepthWidth = 848;
+constexpr int kDepthHeight = 480;
 constexpr int kFps = 30;
 
 // Fraction of the screen the window should occupy by default.
@@ -132,15 +137,19 @@ int main(int argc, char** argv) try {
 
   rs2::pipeline pipe;
   rs2::config cfg;
-  cfg.enable_stream(RS2_STREAM_COLOR, kWidth, kHeight, RS2_FORMAT_BGR8, kFps);
-  cfg.enable_stream(RS2_STREAM_DEPTH, kWidth, kHeight, RS2_FORMAT_Z16, kFps);
+  cfg.enable_stream(RS2_STREAM_COLOR, kColorWidth, kColorHeight, RS2_FORMAT_BGR8,
+                    kFps);
+  cfg.enable_stream(RS2_STREAM_DEPTH, kDepthWidth, kDepthHeight, RS2_FORMAT_Z16,
+                    kFps);
 
   rs2::pipeline_profile profile;
   try {
     profile = pipe.start(cfg);
   } catch (const rs2::error& e) {
-    std::cerr << "Requested " << kWidth << "x" << kHeight << "@" << kFps
-              << " failed (" << e.what() << "); falling back to defaults.\n";
+    std::cerr << "Requested color " << kColorWidth << "x" << kColorHeight
+              << " + depth " << kDepthWidth << "x" << kDepthHeight << "@"
+              << kFps << " failed (" << e.what()
+              << "); falling back to defaults.\n";
     rs2::config fallback;
     fallback.enable_stream(RS2_STREAM_COLOR);
     fallback.enable_stream(RS2_STREAM_DEPTH);
