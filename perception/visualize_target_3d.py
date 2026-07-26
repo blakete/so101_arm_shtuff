@@ -20,11 +20,26 @@ The viewer is a separate window you can orbit with the mouse.
 import argparse
 import json
 import os
+import subprocess
 import sys
+import time
 
 import cv2
 import numpy as np
 import rerun as rr
+
+
+def ensure_rerun_viewer_on_path():
+    """The rerun-sdk wheel ships the viewer binary but never puts it on PATH,
+    so rr.init(spawn=True) fails with 'Failed to find Rerun Viewer executable'
+    even though it is installed. Point PATH at the bundled copy."""
+    cli_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(rr.__file__))),
+                           "rerun_cli")
+    binary = os.path.join(cli_dir, "rerun")
+    if os.path.isfile(binary) and os.access(binary, os.X_OK):
+        os.environ["PATH"] = cli_dir + os.pathsep + os.environ.get("PATH", "")
+        return binary
+    return None
 
 # Reuse the detector from the sibling script rather than duplicating it.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -133,6 +148,8 @@ def main():
                     help="cloud subsample for display (default 2)")
     ap.add_argument("--margin", type=float, default=0.008,
                     help="metres above the table a pixel must be to count (default 8mm)")
+    ap.add_argument("--zmax", type=float, default=1.2,
+                    help="clip the displayed cloud beyond this depth, metres (default 1.2)")
     ap.add_argument("--fp16", action="store_true")
     ap.add_argument("--no-spawn", action="store_true",
                     help="do not open the viewer; just save a .rrd")
@@ -210,16 +227,43 @@ def main():
           % (2 * half[0], 2 * half[1], 2 * half[2]))
 
     # --- 5. log to rerun ------------------------------------------------------
-    rr.init("so101_grasp_target", spawn=not args.no_spawn)
-    if args.rrd:
-        rr.save(args.rrd)
+    # Write the recording to a file, then open the viewer ON that file, rather
+    # than using spawn=True. Two reasons: rr.save() after rr.init(spawn=True)
+    # REPLACES the sink, so the data silently goes to the file and the spawned
+    # viewer stays empty; and streaming over TCP races the viewer's startup.
+    # File-then-open is deterministic and leaves a reusable artifact.
+    rrd_path = os.path.abspath(
+        args.rrd or os.path.join("detections", os.path.basename(args.stem) + ".rrd"))
+    os.makedirs(os.path.dirname(rrd_path), exist_ok=True)
+    rr.init("so101_grasp_target")
+    rr.save(rrd_path)
+
+    # Explicit layout: big 3D view beside the annotated image, so the viewer
+    # does not have to guess and the 3D pane gets most of the window.
+    try:
+        import rerun.blueprint as rrb
+        rr.send_blueprint(rrb.Blueprint(
+            rrb.Horizontal(
+                rrb.Spatial3DView(name="point cloud + AABB", origin="/world"),
+                rrb.Spatial2DView(name="detection", origin="/image"),
+                column_shares=[2.0, 1.0],
+            ),
+            collapse_panels=True,
+        ))
+    except Exception as e:
+        print("blueprint not applied (%s); using default layout" % e)
 
     # Camera optical frame: X right, Y down, Z forward.
     rr.log("world", rr.ViewCoordinates.RDF, static=True)
 
     cloud_pts, cloud_valid = deproject_grid(depth_mm, meta, stride=args.stride)
     rgb = cv2.cvtColor(color, cv2.COLOR_BGR2RGB)[::args.stride, ::args.stride]
-    sel = cloud_valid
+    # Clip to a workspace volume. Without this the cloud runs out to the far
+    # wall and floor several metres away, which blows up the scene bounds and
+    # leaves the viewer's default camera parked inside the desk.
+    sel = cloud_valid & (cloud_pts[..., 2] < args.zmax)
+    print("cloud: %d points within %.1f m (of %d valid)"
+          % (int(sel.sum()), args.zmax, int(cloud_valid.sum())))
     rr.log("world/cloud", rr.Points3D(positions=cloud_pts[sel],
                                       colors=rgb[sel], radii=0.0015))
     rr.log("world/object", rr.Points3D(positions=obj_pts,
@@ -240,8 +284,24 @@ def main():
     os.makedirs("detections", exist_ok=True)
     cv2.imwrite(out_png, overlay)
     print("wrote %s" % out_png)
-    print("Rerun viewer launched - orbit with left-drag, pan with middle-drag, "
-          "zoom with scroll.")
+
+    # Make sure every logged chunk has hit disk before the viewer opens it.
+    try:
+        rr.flush(blocking=True)
+    except Exception:
+        time.sleep(3.0)
+    print("wrote %s (%.1f MB)" % (rrd_path, os.path.getsize(rrd_path) / 1e6))
+
+    if not args.no_spawn:
+        viewer = ensure_rerun_viewer_on_path()
+        if not viewer:
+            print("Rerun viewer binary not found; open %s manually." % rrd_path,
+                  file=sys.stderr)
+            return 1
+        subprocess.Popen([viewer, rrd_path],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        print("Rerun viewer opened on %s" % os.environ.get("DISPLAY", "?"))
+        print("  orbit: left-drag   pan: middle-drag (or shift+left)   zoom: scroll")
     return 0
 
 
