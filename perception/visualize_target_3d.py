@@ -29,61 +29,15 @@ import numpy as np
 import rerun as rr
 
 
-def ensure_rerun_viewer_on_path():
-    """The rerun-sdk wheel ships the viewer binary but never puts it on PATH,
-    so rr.init(spawn=True) fails with 'Failed to find Rerun Viewer executable'
-    even though it is installed. Point PATH at the bundled copy."""
-    cli_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(rr.__file__))),
-                           "rerun_cli")
-    binary = os.path.join(cli_dir, "rerun")
-    if os.path.isfile(binary) and os.access(binary, os.X_OK):
-        os.environ["PATH"] = cli_dir + os.pathsep + os.environ.get("PATH", "")
-        return binary
-    return None
-
-# Reuse the detector from the sibling script rather than duplicating it.
+# Sibling modules: the detector and the table-plane estimator. table_frame owns
+# the geometry helpers so they are not duplicated here.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import detect_owlv2 as det  # noqa: E402
+import detect_owlv2 as det   # noqa: E402
+import table_frame as tf     # noqa: E402
 
-
-def deproject_grid(depth_mm, meta, stride=1):
-    """Full-frame deprojection. Returns (points Nx3, mask HxW bool, uv indices)."""
-    h, w = depth_mm.shape[:2]
-    us, vs = np.meshgrid(np.arange(0, w, stride, dtype=np.float32),
-                         np.arange(0, h, stride, dtype=np.float32))
-    z = depth_mm[::stride, ::stride].astype(np.float32) / 1000.0
-    valid = z > 0
-    x = (us - meta["ppx"]) / meta["fx"] * z
-    y = (vs - meta["ppy"]) / meta["fy"] * z
-    pts = np.stack([x, y, z], axis=-1)
-    return pts, valid
-
-
-def fit_plane_ransac(pts, iters=300, thresh=0.006, seed=0):
-    """Fit the dominant plane. Returns ((normal, d), inlier_mask) or (None, None).
-
-    Used on the ring around the detection box, which on this desk is table
-    surface, so the dominant plane there is the support surface.
-    """
-    n = len(pts)
-    if n < 50:
-        return None, None
-    rng = np.random.default_rng(seed)
-    best_plane, best_count, best_inl = None, -1, None
-    for _ in range(iters):
-        idx = rng.choice(n, 3, replace=False)
-        p0, p1, p2 = pts[idx]
-        nv = np.cross(p1 - p0, p2 - p0)
-        norm = np.linalg.norm(nv)
-        if norm < 1e-9:
-            continue
-        nv = nv / norm
-        d = -float(nv.dot(p0))
-        inl = np.abs(pts @ nv + d) < thresh
-        c = int(inl.sum())
-        if c > best_count:
-            best_plane, best_count, best_inl = (nv, d), c, inl
-    return best_plane, best_inl
+ensure_rerun_viewer_on_path = tf.ensure_rerun_viewer_on_path
+deproject_grid = tf.deproject_grid
+fit_plane_ransac = tf.fit_plane_ransac
 
 
 def segment_in_box(depth_mm, meta, box, plane, margin=0.008):
@@ -148,6 +102,8 @@ def main():
                     help="cloud subsample for display (default 2)")
     ap.add_argument("--margin", type=float, default=0.008,
                     help="metres above the table a pixel must be to count (default 8mm)")
+    ap.add_argument("--no-table-frame", action="store_true",
+                    help="stay in the raw camera frame (tilted view, tilted box)")
     ap.add_argument("--zmax", type=float, default=1.2,
                     help="clip the displayed cloud beyond this depth, metres (default 1.2)")
     ap.add_argument("--fp16", action="store_true")
@@ -216,15 +172,31 @@ def main():
         return 1
     keep = reject_outliers(obj_pts)
     obj_pts = obj_pts[keep]
-
-    lo = obj_pts.min(axis=0)
-    hi = obj_pts.max(axis=0)
-    center = (lo + hi) / 2.0
-    half = (hi - lo) / 2.0
     print("object points: %d" % len(obj_pts))
-    print("AABB centre  : (%+.3f, %+.3f, %+.3f) m" % tuple(center))
-    print("AABB size    : %.3f x %.3f x %.3f m (WxHxD, camera frame)"
-          % (2 * half[0], 2 * half[1], 2 * half[2]))
+
+    # Recover the table frame. Two payoffs: the viewer can render the desk flat,
+    # and the bounding box stops inheriting the camera's tilt as fake extent.
+    frame = None
+    if not args.no_table_frame:
+        try:
+            frame = tf.estimate_table_frame(depth_mm, meta, zmax=max(args.zmax, 1.5))
+            print("table frame  : camera %.3f m above table, optical axis %.1f deg "
+                  "to surface, roll %.1f deg"
+                  % (frame["camera_height_m"], frame["optical_axis_tilt_deg"],
+                     frame["camera_roll_deg"]))
+        except RuntimeError as e:
+            print("table frame estimation failed (%s); staying in camera frame" % e)
+
+    obj_disp = tf.to_table(obj_pts, frame) if frame is not None else obj_pts
+    lo, hi = obj_disp.min(axis=0), obj_disp.max(axis=0)
+    center, half = (lo + hi) / 2.0, (hi - lo) / 2.0
+    fname = "table" if frame is not None else "camera"
+    print("AABB centre  : (%+.3f, %+.3f, %+.3f) m  [%s frame]"
+          % (center[0], center[1], center[2], fname))
+    print("AABB size    : %.3f x %.3f x %.3f m  [%s frame]"
+          % (2 * half[0], 2 * half[1], 2 * half[2], fname))
+    if frame is not None:
+        print("             : sits %.3f m proud of the table" % float(hi[2]))
 
     # --- 5. log to rerun ------------------------------------------------------
     # Write the recording to a file, then open the viewer ON that file, rather
@@ -253,8 +225,11 @@ def main():
     except Exception as e:
         print("blueprint not applied (%s); using default layout" % e)
 
-    # Camera optical frame: X right, Y down, Z forward.
-    rr.log("world", rr.ViewCoordinates.RDF, static=True)
+    if frame is not None:
+        rr.log("world", rr.ViewCoordinates.RIGHT_HAND_Z_UP, static=True)
+    else:
+        # Raw camera optical frame: X right, Y down, Z forward.
+        rr.log("world", rr.ViewCoordinates.RDF, static=True)
 
     cloud_pts, cloud_valid = deproject_grid(depth_mm, meta, stride=args.stride)
     rgb = cv2.cvtColor(color, cv2.COLOR_BGR2RGB)[::args.stride, ::args.stride]
@@ -264,11 +239,15 @@ def main():
     sel = cloud_valid & (cloud_pts[..., 2] < args.zmax)
     print("cloud: %d points within %.1f m (of %d valid)"
           % (int(sel.sum()), args.zmax, int(cloud_valid.sum())))
-    rr.log("world/cloud", rr.Points3D(positions=cloud_pts[sel],
+    cloud_disp = (tf.to_table(cloud_pts[sel], frame) if frame is not None
+                  else cloud_pts[sel])
+    rr.log("world/cloud", rr.Points3D(positions=cloud_disp,
                                       colors=rgb[sel], radii=0.0015))
-    rr.log("world/object", rr.Points3D(positions=obj_pts,
-                                       colors=np.tile([255, 60, 60], (len(obj_pts), 1)),
+    rr.log("world/object", rr.Points3D(positions=obj_disp,
+                                       colors=np.tile([255, 60, 60], (len(obj_disp), 1)),
                                        radii=0.0025))
+    if frame is not None:
+        tf.log_table_frame(frame)
     rr.log("world/bbox", rr.Boxes3D(centers=[center], half_sizes=[half],
                                     colors=[[60, 255, 120]],
                                     labels=["%s  %.2f" % (best["query"], best["score"])]))
