@@ -1,14 +1,15 @@
-// d455_viewer.cpp - stream RGB + depth from an Intel RealSense D455 and show
-// them side by side in a large window on the desktop.
+// d455_viewer.cpp - stream RGB + depth from an Intel RealSense D455 alongside
+// live SO-101 arm joint positions, in one large window on the desktop.
 //
 //   q / ESC : quit
 //   a       : toggle depth->color alignment
 //   c       : cycle depth colormap
 //   l       : toggle layout (side-by-side <-> stacked)
+//   j       : toggle the joint panel
 //   f       : toggle true fullscreen
 //   s       : save a PNG snapshot of the current view
 //
-// Options: --fullscreen, --scale <0.1..1.0>, --headless
+// Options: --fullscreen, --scale <0.1..1.0>, --headless, --port <dev>, --no-arm
 //
 // Build: see CMakeLists.txt in this directory.
 
@@ -24,7 +25,10 @@
 #include <cstdlib>
 #include <iostream>
 #include <string>
+#include <thread>
 #include <vector>
+
+#include "arm_monitor.h"
 
 #ifdef HAVE_X11
 #include <X11/Xlib.h>
@@ -52,6 +56,13 @@ constexpr int kFps = 30;
 
 // Fraction of the screen the window should occupy by default.
 constexpr double kDefaultScreenFrac = 0.92;
+
+// SO-101 servo bus defaults.
+constexpr const char* kDefaultArmPort = "/dev/ttyACM0";
+constexpr int kArmBaud = 1000000;
+
+// Joint panel width, as a fraction of the video canvas width.
+constexpr double kPanelFrac = 0.42;
 
 // rs2 colorizer presets: 0 Jet, 1 Classic, 2 WhiteToBlack, 3 BlackToWhite,
 // 4 Bio, 5 Cold, 6 Warm, 7 Quantized, 8 Pattern, 9 Hue
@@ -106,20 +117,54 @@ void draw_label(cv::Mat& img, const std::string& text, cv::Point org) {
 int main(int argc, char** argv) try {
   bool headless = false;
   bool fullscreen = false;
+  bool use_arm = true;
+  bool dump_joints = false;
   double frac = kDefaultScreenFrac;
+  std::string arm_port = kDefaultArmPort;
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
     if (a == "--headless") {
       headless = true;
     } else if (a == "--fullscreen") {
       fullscreen = true;
+    } else if (a == "--no-arm") {
+      use_arm = false;
+    } else if (a == "--dump-joints") {
+      dump_joints = true;
+    } else if (a == "--port" && i + 1 < argc) {
+      arm_port = argv[++i];
     } else if (a == "--scale" && i + 1 < argc) {
       frac = std::clamp(std::atof(argv[++i]), 0.1, 1.0);
     } else {
       std::cerr << "Usage: " << argv[0]
-                << " [--headless] [--fullscreen] [--scale 0.1..1.0]\n";
+                << " [--headless] [--fullscreen] [--scale 0.1..1.0]"
+                   " [--port /dev/ttyACM0] [--no-arm] [--dump-joints]\n";
       return 2;
     }
+  }
+
+  // Servo-bus only: no camera, no window. Handy for checking the arm over SSH.
+  if (dump_joints) {
+    arm::Monitor mon;
+    mon.start(arm_port, kArmBaud);
+    for (int t = 0; t < 10; ++t) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(500));
+      const arm::Snapshot s = mon.snapshot();
+      std::printf("[%4.0f Hz] %s\n", s.poll_hz, s.status.c_str());
+      for (int i = 0; i < arm::kNumJoints; ++i) {
+        const arm::Joint& j = s.joints[i];
+        if (!j.responding) {
+          std::printf("  %d %-14s  no response\n", i + 1, arm::kJointNames[i]);
+          continue;
+        }
+        std::printf("  %d %-14s %4u tk  %+7.1f deg  load %+5.1f%%  %2u C  %.1f V\n",
+                    i + 1, arm::kJointNames[i], j.p.position,
+                    arm::ticks_to_deg(j.p.position), j.p.load / 10.0,
+                    j.p.temperature, j.p.voltage / 10.0);
+      }
+    }
+    mon.stop();
+    return 0;
   }
 
   rs2::context ctx;
@@ -174,8 +219,18 @@ int main(int argc, char** argv) try {
   colorizer.set_option(RS2_OPTION_COLOR_SCHEME,
                        static_cast<float>(kColormaps[colormap_idx].first));
 
+  // The servo bus is polled on its own thread; the camera loop only ever reads
+  // the latest snapshot, so bus latency cannot drag the framerate down.
+  arm::Monitor arm_monitor;
+  if (use_arm) {
+    arm_monitor.start(arm_port, kArmBaud);
+    std::cout << "Arm    : polling " << arm_port << " @ " << kArmBaud / 1000000
+              << " Mbaud" << std::endl;
+  }
+
   bool aligned = true;
   bool side_by_side = true;
+  bool show_panel = use_arm;
   bool window_was_visible = false;
   cv::Size sized_for(0, 0);  // canvas size the window was last fitted to
 
@@ -229,7 +284,8 @@ int main(int argc, char** argv) try {
                   aligned ? "aligned->color" : "raw",
                   kColormaps[colormap_idx].second, center_m);
     draw_label(depth_img, buf, {14, 38});
-    draw_label(depth_img, "q quit   a align   c colormap   l layout   f fullscreen   s snapshot",
+    draw_label(depth_img,
+               "q quit  a align  c colormap  l layout  j joints  f fullscreen  s snapshot",
                {14, depth_img.rows - 18});
 
     // Center crosshair on both panes so the readout has a visible target.
@@ -253,6 +309,12 @@ int main(int argc, char** argv) try {
                             depth_img.rows * color_img.cols / depth_img.cols));
       }
       cv::vconcat(color_img, depth_img, canvas);
+    }
+
+    if (show_panel) {
+      const int pw = static_cast<int>(canvas.cols * kPanelFrac);
+      cv::Mat panel = arm::render_panel(arm_monitor.snapshot(), pw, canvas.rows);
+      cv::hconcat(canvas, panel, canvas);
     }
 
     if (headless) {
@@ -289,6 +351,8 @@ int main(int argc, char** argv) try {
       aligned = !aligned;
     } else if (key == 'l') {
       side_by_side = !side_by_side;
+    } else if (key == 'j') {
+      show_panel = !show_panel;
     } else if (key == 'f') {
       fullscreen = !fullscreen;
       cv::setWindowProperty(
@@ -317,6 +381,7 @@ int main(int argc, char** argv) try {
     }
   }
 
+  arm_monitor.stop();
   pipe.stop();
   return 0;
 } catch (const rs2::error& e) {

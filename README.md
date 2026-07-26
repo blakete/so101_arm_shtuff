@@ -5,7 +5,8 @@ Scratch workspace for the SO-101 arm + D455 setup on `exopack` (Jetson, L4T 35.4
 ## d455_viewer
 
 C++ viewer that streams RGB + depth from the Intel RealSense D455 and shows
-them side by side in one window.
+them side by side in one window, with a live SO-101 joint-position panel
+alongside.
 
 - Color at 1280x720 @ 30 fps, depth at 848x480 @ 30 fps. Falls back to
   librealsense defaults if that profile combination is unavailable.
@@ -13,6 +14,39 @@ them side by side in one window.
 - The window auto-sizes to 92% of the detected screen and centers itself.
 - Overlay shows live fps, alignment mode, colormap, and the depth in meters at
   the center crosshair.
+
+## Joint panel
+
+`sts_bus.h` speaks the Feetech STS/SCS serial protocol to the arm's six STS3215
+servos over `/dev/ttyACM0` at 1 Mbaud. One 8-byte read per servo from address 56
+returns position, speed, load, voltage and temperature in a single transaction.
+
+`arm_monitor.h` runs that polling on its own thread (~45 Hz measured) and hands
+the render loop a mutex-guarded snapshot. This matters: each USB-CDC round trip
+costs a millisecond or two, so polling six servos inline in the camera loop
+would cost roughly a third of the framerate. If the port cannot be opened the
+thread retries once a second, so plugging the arm in mid-run picks it up, and an
+absent arm just shows "no response" rows without touching the video.
+
+**Read-only.** The bus client implements PING and READ only — there is no code
+path that writes a servo register, so it cannot change torque, limits, IDs, or
+commanded position.
+
+### Two caveats on what the numbers mean
+
+- **Angles are uncalibrated.** Degrees are computed as offset from the servo's
+  mid-travel point (2048 of 4096 ticks) in the servo's own frame. No homing
+  offsets or per-joint direction flips are applied, so this is "where each
+  servo is", not "where a LeRobot arm model thinks the joint is".
+- **Joint names are assumed** from the standard SO-101 convention for IDs 1-6.
+  Six servos at IDs 1-6 is confirmed; which physical joint each ID drives is
+  not independently verified here.
+
+### Bus ownership
+
+Only one process should hold the servo port at a time. Running `--dump-joints`
+while the viewer is up (or alongside a LeRobot session) means two readers
+interleaving on the same half-duplex bus. Stop one before starting the other.
 
 ### Why depth is 848x480 and not 1280x720
 
@@ -55,6 +89,9 @@ seat0):
 | --- | --- |
 | `--scale 0.1..1.0` | fraction of the screen the window fills (default `0.92`) |
 | `--fullscreen` | start in true fullscreen |
+| `--port <dev>` | servo bus device (default `/dev/ttyACM0`) |
+| `--no-arm` | skip the servo bus entirely; camera only |
+| `--dump-joints` | print joint readings to stdout for 5 s and exit (no camera, no window) |
 | `--headless` | no window; grab 30 frames and write `/tmp/d455_headless.png` |
 
 ### Keys
@@ -65,6 +102,7 @@ seat0):
 | `a` | toggle depth→color alignment |
 | `c` | cycle depth colormap (Jet / WhiteToBlack / BlackToWhite / Hue) |
 | `l` | toggle layout (side-by-side ↔ stacked) |
+| `j` | toggle the joint panel |
 | `f` | toggle fullscreen |
 | `s` | save `d455_snapshot_N.png` of the current view |
 

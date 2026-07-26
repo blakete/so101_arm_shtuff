@@ -16,8 +16,13 @@ pkg_check_modules(OPENCV4 REQUIRED IMPORTED_TARGET opencv4)
 # Optional: used only to query the screen size so the window can auto-fit.
 pkg_check_modules(X11 IMPORTED_TARGET x11)
 
+# The servo bus is polled on a background thread.
+set(THREADS_PREFER_PTHREAD_FLAG ON)
+find_package(Threads REQUIRED)
+
 add_executable(d455_viewer d455_viewer.cpp)
-target_link_libraries(d455_viewer PRIVATE PkgConfig::REALSENSE2 PkgConfig::OPENCV4)
+target_link_libraries(d455_viewer PRIVATE PkgConfig::REALSENSE2 PkgConfig::OPENCV4
+                                          Threads::Threads)
 if(X11_FOUND)
   target_link_libraries(d455_viewer PRIVATE PkgConfig::X11)
   target_compile_definitions(d455_viewer PRIVATE HAVE_X11)
