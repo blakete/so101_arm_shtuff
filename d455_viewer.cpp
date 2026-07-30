@@ -1,15 +1,18 @@
 // d455_viewer.cpp - stream RGB + depth from an Intel RealSense D455 alongside
-// live SO-101 arm joint positions, in one large window on the desktop.
+// the USB wrist camera and live SO-101 arm joint positions, in one large
+// window on the desktop.
 //
 //   q / ESC : quit
 //   a       : toggle depth->color alignment
 //   c       : cycle depth colormap
-//   l       : toggle layout (side-by-side <-> stacked)
+//   l       : toggle layout (grid <-> row <-> stacked)
 //   j       : toggle the joint panel
+//   w       : toggle the wrist camera pane
 //   f       : toggle true fullscreen
 //   s       : save a PNG snapshot of the current view
 //
-// Options: --fullscreen, --scale <0.1..1.0>, --headless, --port <dev>, --no-arm
+// Options: --fullscreen, --scale <0.1..1.0>, --headless, --port <dev>,
+//          --no-arm, --wrist-dev <dev>, --no-wrist
 //
 // Build: see CMakeLists.txt in this directory.
 
@@ -30,6 +33,7 @@
 #include <vector>
 
 #include "arm_monitor.h"
+#include "usb_cam.h"
 
 #ifdef HAVE_X11
 #include <X11/Xlib.h>
@@ -127,15 +131,25 @@ void draw_label(cv::Mat& img, const std::string& text, cv::Point org) {
               cv::Scalar(255, 255, 255), th, cv::LINE_AA);
 }
 
+// Placeholder pane shown while the wrist camera is absent or reconnecting.
+cv::Mat wrist_status_pane(const cv::Size& size, const std::string& status) {
+  cv::Mat pane(size, CV_8UC3, cv::Scalar(24, 20, 18));  // matches the arm panel
+  draw_label(pane, "Wrist  (no video)", {14, 38});
+  draw_label(pane, status, {14, size.height / 2});
+  return pane;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) try {
   bool headless = false;
   bool fullscreen = false;
   bool use_arm = true;
+  bool use_wrist = true;
   bool dump_joints = false;
   double frac = kDefaultScreenFrac;
   std::string arm_port = kDefaultArmPort;
+  std::string wrist_dev = usbcam::kDefaultDevice;
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
     if (a == "--headless") {
@@ -144,6 +158,10 @@ int main(int argc, char** argv) try {
       fullscreen = true;
     } else if (a == "--no-arm") {
       use_arm = false;
+    } else if (a == "--no-wrist") {
+      use_wrist = false;
+    } else if (a == "--wrist-dev" && i + 1 < argc) {
+      wrist_dev = argv[++i];
     } else if (a == "--dump-joints") {
       dump_joints = true;
     } else if (a == "--port" && i + 1 < argc) {
@@ -153,7 +171,8 @@ int main(int argc, char** argv) try {
     } else {
       std::cerr << "Usage: " << argv[0]
                 << " [--headless] [--fullscreen] [--scale 0.1..1.0]"
-                   " [--port /dev/ttyACM0] [--no-arm] [--dump-joints]\n";
+                   " [--port /dev/ttyACM0] [--no-arm] [--dump-joints]"
+                   " [--wrist-dev /dev/video6] [--no-wrist]\n";
       return 2;
     }
   }
@@ -271,13 +290,24 @@ int main(int argc, char** argv) try {
     }
   }
 
+  // The wrist camera gets the same treatment as the servo buses: its own
+  // grabber thread publishing the latest frame, so MJPG decode time or an
+  // unplugged camera never drags the D455 loop.
+  usbcam::Monitor wrist;
+  if (use_wrist) {
+    wrist.start(wrist_dev);
+    std::cout << "Wrist  : " << wrist_dev << std::endl;
+  }
+
   bool aligned = true;
   Layout layout = Layout::kGrid;
   bool show_panel = use_arm;
+  bool show_wrist = use_wrist;
   bool window_was_visible = false;
   cv::Size sized_for(0, 0);  // canvas size the window was last fitted to
 
-  const std::string win = "D455  |  RGB + Depth";
+  const std::string win = use_wrist ? "D455  |  RGB + Depth + Wrist"
+                                    : "D455  |  RGB + Depth";
   if (!headless) {
     // WINDOW_NORMAL lets us resize freely; the backend scales the image to the
     // window, so the camera keeps running at its native resolution.
@@ -328,7 +358,7 @@ int main(int argc, char** argv) try {
                   kColormaps[colormap_idx].second, center_m);
     draw_label(depth_img, buf, {14, 38});
     draw_label(depth_img,
-               "q quit  a align  c colormap  l layout  j joints  f fullscreen  s snapshot",
+               "q quit  a align  c colormap  l layout  j joints  w wrist  f fullscreen  s snapshot",
                {14, depth_img.rows - 18});
 
     // Center crosshair on both panes so the readout has a visible target.
@@ -345,34 +375,61 @@ int main(int argc, char** argv) try {
       }
     }
 
+    cv::Mat wrist_img;
+    if (use_wrist && show_wrist) {
+      const usbcam::Snapshot ws = wrist.snapshot();
+      if (!ws.frame.empty()) {
+        wrist_img = ws.frame.clone();  // HUD must not touch the shared frame
+        std::snprintf(buf, sizeof(buf), "Wrist  %dx%d  %.1f fps",
+                      wrist_img.cols, wrist_img.rows, ws.fps);
+        draw_label(wrist_img, buf, {14, 38});
+      } else {
+        wrist_img = wrist_status_pane(color_img.size(), ws.status);
+      }
+    }
+
     cv::Mat canvas;
-    if (!snaps.empty() && layout == Layout::kGrid) {
-      // 2x2: arm panels down the left column, camera streams down the right.
-      // Depth is forced to the color cell size so all four cells match, which
-      // matters when alignment is off and depth is still at 848x480.
+    if (layout == Layout::kGrid && (!snaps.empty() || !wrist_img.empty())) {
+      // 2x2: wrist cam and arm panels down the left column, RGB over depth
+      // down the right. Depth is forced to the color cell size so the rows
+      // line up, which matters when alignment is off and depth is at 848x480.
       if (depth_img.size() != color_img.size()) {
         cv::resize(depth_img, depth_img, color_img.size());
       }
       cv::Mat right;
       cv::vconcat(color_img, depth_img, right);
-      cv::Mat left =
-          arm::render_panels(arm_titles, snaps, color_img.cols, right.rows);
+      cv::Mat left;
+      if (!wrist_img.empty()) {
+        if (wrist_img.size() != color_img.size()) {
+          cv::resize(wrist_img, wrist_img, color_img.size());
+        }
+        // With no arms this renders as a blank cell, which keeps the grid.
+        cv::Mat lower = arm::render_panels(arm_titles, snaps, color_img.cols,
+                                           right.rows - color_img.rows);
+        cv::vconcat(wrist_img, lower, left);
+      } else {
+        left = arm::render_panels(arm_titles, snaps, color_img.cols, right.rows);
+      }
       cv::hconcat(left, right, canvas);
     } else {
-      if (layout == Layout::kStack) {
-        if (depth_img.cols != color_img.cols) {
-          cv::resize(depth_img, depth_img,
-                     cv::Size(color_img.cols,
-                              depth_img.rows * color_img.cols / depth_img.cols));
+      canvas = color_img;
+      for (cv::Mat m : {depth_img, wrist_img}) {
+        if (m.empty()) {
+          continue;
         }
-        cv::vconcat(color_img, depth_img, canvas);
-      } else {
-        if (depth_img.rows != color_img.rows) {
-          cv::resize(depth_img, depth_img,
-                     cv::Size(depth_img.cols * color_img.rows / depth_img.rows,
-                              color_img.rows));
+        if (layout == Layout::kStack) {
+          if (m.cols != color_img.cols) {
+            cv::resize(m, m, cv::Size(color_img.cols,
+                                      m.rows * color_img.cols / m.cols));
+          }
+          cv::vconcat(canvas, m, canvas);
+        } else {
+          if (m.rows != color_img.rows) {
+            cv::resize(m, m, cv::Size(m.cols * color_img.rows / m.rows,
+                                      color_img.rows));
+          }
+          cv::hconcat(canvas, m, canvas);
         }
-        cv::hconcat(color_img, depth_img, canvas);
       }
       if (!snaps.empty()) {
         const int pw = static_cast<int>(canvas.cols * kPanelFrac);
@@ -417,6 +474,9 @@ int main(int argc, char** argv) try {
       layout = next_layout(layout);
     } else if (key == 'j') {
       show_panel = !show_panel;
+    } else if (key == 'w') {
+      show_wrist = !show_wrist;
+      sized_for = cv::Size(0, 0);  // canvas shape changes; refit the window
     } else if (key == 'f') {
       fullscreen = !fullscreen;
       cv::setWindowProperty(
@@ -448,6 +508,7 @@ int main(int argc, char** argv) try {
   for (auto& m : monitors) {
     m->stop();
   }
+  wrist.stop();
   pipe.stop();
   return 0;
 } catch (const rs2::error& e) {
