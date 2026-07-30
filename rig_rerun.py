@@ -28,6 +28,8 @@ import math
 import os
 import select
 import signal
+import socket
+import subprocess
 import sys
 import termios
 import threading
@@ -413,6 +415,42 @@ def jpeg(img_rgb):
         return rr.Image(img_rgb)
 
 
+VIEWER_PORT = 9876
+
+
+def ensure_viewer_and_connect():
+    """Launch the viewer ourselves instead of rr.spawn(): spawn cannot pass
+    --drop-at-latency, and without it the viewer's ingest queue grows without
+    bound whenever we log faster than it indexes - the view then falls
+    arbitrarily far behind realtime. With the flag, stale messages are
+    DROPPED at the queue: bounded latency, best-effort display."""
+    addr = ("127.0.0.1", VIEWER_PORT)
+
+    def listening():
+        s = socket.socket()
+        s.settimeout(0.3)
+        try:
+            s.connect(addr)
+            return True
+        except OSError:
+            return False
+        finally:
+            s.close()
+
+    if not listening():
+        subprocess.Popen(
+            ["rerun", "--port=%d" % VIEWER_PORT, "--memory-limit=512MB",
+             "--drop-at-latency=1000ms", "--expect-data-soon"],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, start_new_session=True)
+        t0 = time.monotonic()
+        while not listening():
+            if time.monotonic() - t0 > 15.0:
+                raise RuntimeError("rerun viewer did not start")
+            time.sleep(0.3)
+    rr.connect("127.0.0.1:%d" % VIEWER_PORT)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--serve", action="store_true",
@@ -440,12 +478,7 @@ def main():
     if args.serve:
         rr.serve(open_browser=False)
     else:
-        try:
-            # Modest store: GC of a big backlog stalls the viewer, and those
-            # pauses are exactly when the ingest queue starts to build.
-            rr.spawn(memory_limit="2GB")
-        except TypeError:
-            rr.spawn()
+        ensure_viewer_and_connect()
 
     try:
         import rerun.blueprint as rrb
@@ -522,6 +555,10 @@ def main():
             print("CALIBRATION: pose the real arm to overlap the frozen "
                   "virtual arm (watch the cloud), then run:  touch %s"
                   % CAPTURE_TRIGGER, flush=True)
+        # Let the 16MB of static meshes drain before the camera loop starts
+        # competing for the ingest queue - drop-at-latency would otherwise
+        # happily discard them, and statics are never re-sent.
+        time.sleep(2.5)
 
     # Precomputed back-projection rays for the decimated aligned-depth grid.
     vs, us = np.mgrid[0:COLOR_H:CLOUD_STEP, 0:COLOR_W:CLOUD_STEP]
@@ -658,8 +695,12 @@ def main():
                     name: calib[name]["sign"] * (t - calib[name]["zero"])
                     * RAD_PER_TICK for name, t in ticks.items()}
                 model.log_pose(angles)
-                for name, q in angles.items():
-                    rr.log("joints/" + name, rr.Scalar(math.degrees(q)))
+                # Scalars at ~10 Hz: the plot view re-aggregates its whole
+                # retained history every redraw, so series growth is a real
+                # viewer cost that ends up starving ingest.
+                if n_frame % 3 == 0:
+                    for name, q in angles.items():
+                        rr.log("joints/" + name, rr.Scalar(math.degrees(q)))
 
         if n_frame % 300 == 0:
             print("frame %d  %.1f fps  %d pts" %
