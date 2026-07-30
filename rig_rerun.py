@@ -46,7 +46,14 @@ COLOR_W, COLOR_H = 1280, 720
 DEPTH_W, DEPTH_H = 848, 480     # D455 native stereo resolution
 FPS = 30
 CLOUD_STEP = 4                  # decimation of the aligned depth grid
-CLOUD_EVERY = 2                 # log the cloud every Nth frame
+# Best-effort rate caps. Everything shares ONE ordered SDK->viewer stream, so
+# if images+cloud outpace the viewer's ingest the queue grows without bound
+# and even the tiny arm transforms arrive seconds late (0.18 cannot drop
+# queued data). Keep produced bandwidth under viewer capacity; the arm FK
+# still logs every frame, so it stays the lowest-latency thing in the scene.
+CLOUD_EVERY = 3                 # log the cloud every Nth frame (~10 Hz)
+IMG_EVERY = 2                   # log the D455 color every Nth frame (~15 Hz)
+JPEG_QUALITY = 70
 DEPTH_MIN, DEPTH_MAX = 0.15, 4.0            # meters
 PLANE_THRESH = 0.008            # RANSAC inlier distance, meters
 # Workspace crop in the table frame: without it, returns from the office
@@ -401,7 +408,7 @@ def world_from_camera(n, d):
 
 def jpeg(img_rgb):
     try:
-        return rr.Image(img_rgb).compress(jpeg_quality=80)
+        return rr.Image(img_rgb).compress(jpeg_quality=JPEG_QUALITY)
     except Exception:
         return rr.Image(img_rgb)
 
@@ -434,7 +441,9 @@ def main():
         rr.serve(open_browser=False)
     else:
         try:
-            rr.spawn(memory_limit="4GB")
+            # Modest store: GC of a big backlog stalls the viewer, and those
+            # pauses are exactly when the ingest queue starts to build.
+            rr.spawn(memory_limit="2GB")
         except TypeError:
             rr.spawn()
 
@@ -603,7 +612,8 @@ def main():
                       (bx, by, math.degrees(yaw)), flush=True)
             fitted = True
 
-        rr.log("world/camera/image/rgb", jpeg(color))
+        if n_frame % IMG_EVERY == 0:
+            rr.log("world/camera/image/rgb", jpeg(color))
         if fitted and n_frame % CLOUD_EVERY == 0:
             cols = color[::CLOUD_STEP, ::CLOUD_STEP][valid]
             pw = (pts - c0) @ A.T
